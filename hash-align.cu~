@@ -1,0 +1,710 @@
+/* Memocode design
+ * hash-align.cu
+ * Uses a static hash table sructure stored in hash_table1.bin and
+ * hash_table2.bin, based on 24-bit binary strings from the supplied 
+ * genome_file, and performs alignment on the sequence file. 
+ * Sample usage:
+ *
+ * ./align human_g1k_v37.bin ERR050082.filt.bin 100 machine_number 0 9999
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <unistd.h>>
+#include <stdint.h>
+#include <string.h
+
+#include <sys/time.h>
+#include <time.h>
+
+#define HASH_LENGTH 3
+#define TABLE_LENGTH 16777216
+
+                
+/* Assumed alignment for sequences in the sequence file, in bytes */
+#define SEQUENCE_ALIGN 8
+#define TICKS_PER_SEC 2795377101
+
+/*2048 thread blocks of 32 threads each*/
+#define NUM_BLOCKS 2048
+#define NUM_THREADS 32
+
+typedef unsigned long long ticks;
+
+/* Result of matching a single sequence- Each entry is 8 bytes; */
+struct match {
+  uint32_t position;      /* Position of a match if count > 0 */
+  uint32_t count;        /* Number of matches found */
+};
+
+static __inline__ ticks getticks(void)
+{
+     unsigned a, d;
+     asm("cpuid");
+     asm volatile("rdtsc" : "=a" (a), "=d" (d));
+
+     return (((ticks)a) | (((ticks)d) << 32));
+}
+
+__global__ void matchKernel ( char *ref_genome_GPU,                  /*Base pointer of reference genome*/
+	                      char *read_seq_GPU,                    /*Base pointer of read sequence*/
+	                      struct match *result_GPU,              /*Base pointer of match array*/
+	                      uint32_t *GPU_table_1_base,            /*Base pointer of hash_table_1*/
+	                      uint32_t *GPU_table_2_base,            /*Base pointer of hash_table_2*/
+	                      uint32_t table_1_start,                /*Index of table 1 that stores first table 2 index*/
+                              uint32_t table_1_end,                  /*Index of table 1 that stores last table 2 index*/
+                              uint32_t kernel,                       /*CUDA kernel number*/
+                              uint32_t start_table_2,                /*First index of table 2 for this machine*/
+                              uint32_t table_1_total,                /*Size of table 1 in bytes*/
+                              uint32_t table_2_total)                /*Size of table 2 in bytes*/
+{
+  
+  uint8_t k,cur_match,aligner,ref_byte_1,ref_byte_2,seq_byte,flag=0;
+  uint32_t i,hash_value,start_ref_index, end_ref_index, ref_index;
+  
+  char *cur_refs;
+ 
+  char cur_seq[25]; 
+ 
+  result_GPU[(65536*kernel)+(blockIdx.x*NUM_THREADS)+threadIdx.x].count = 0;
+  result_GPU[(65536*kernel)+(blockIdx.x*NUM_THREADS)+threadIdx.x].position = 0; 
+ 
+
+   /*Copy read sequence from global memory to internal registers*/
+   for(i=0;i<25;i++)
+   cur_seq[i]= read_seq_GPU[(65536*kernel+blockIdx.x*NUM_THREADS+threadIdx.x)*32 + i];
+ 
+   /*If it is the last index of table 1, we want to compare till end of table 2*/
+   if(table_1_end+1 == table_1_total/4)flag=1;
+  
+   /* Loop through the sequence array */
+
+    hash_value = 0;
+    for (k = 0; k < HASH_LENGTH; k++) {
+      hash_value |= (cur_seq[k]& 0x000000FF) << ((HASH_LENGTH-k-1)*8);
+    }
+    
+    /*Process only if the prefix exists for the block of table 2 present in this machine*/
+    if(hash_value>=table_1_start && hash_value < table_1_end+flag)
+    {
+  
+   /*Indices of the possible entries in table 2 that correspond to the 3 byte prefix*/
+   start_ref_index = GPU_table_1_base[hash_value];
+ 
+    if(flag==1){
+     end_ref_index = table_2_total/4;
+     }else{   
+     end_ref_index = GPU_table_1_base[hash_value+1];
+    }
+    
+    for (i = start_ref_index; i < end_ref_index; i++) {
+               
+         ref_index = GPU_table_2_base[i-start_table_2];
+         
+         /*Check if the base pair position lies at byte boundary */
+         aligner = (ref_index%4)*2;
+         cur_refs = ref_genome_GPU + ref_index/4;
+         
+      cur_match = 1;
+      for (k = 0; k < 25; k++) {
+	
+        seq_byte = cur_seq[k];
+        ref_byte_1 = cur_refs[k];
+        ref_byte_2 = cur_refs[k+1];
+        ref_byte_1 = ref_byte_1 >> aligner;
+        ref_byte_1 = ref_byte_1 & (0xFF >> aligner);
+        ref_byte_1 = ref_byte_1 | ((ref_byte_2 & (0xFF >> (8-aligner))) << 8-aligner); 
+	
+        if (seq_byte != ref_byte_1) {
+	  cur_match = 0;
+	  break;
+	}
+      }
+      
+      if (cur_match == 1) {
+		result_GPU[65536*kernel+blockIdx.x*NUM_THREADS+threadIdx.x].count++;
+		result_GPU[65536*kernel+blockIdx.x*NUM_THREADS+threadIdx.x].position = ref_index;
+      }
+
+    }
+  }
+
+}
+
+/*One kernel processes 65536 reasd sequences. When the number of reads is lesser than 65536 or (number of reads)%65536!=0, we use kernel 2 for those reads.It is exactly the same as previous kernel. Except that it uses a thread block for each read*/
+__global__ void matchKernel2 ( char *ref_genome_GPU,
+	                       char *read_seq_GPU,
+	                       struct match *result_GPU, 
+	                       uint32_t *GPU_table_1_base,
+	                       uint32_t *GPU_table_2_base,
+                               uint32_t table_1_start,
+	                       uint32_t table_1_end,
+                               uint32_t kernel,
+                               uint32_t start_table_2,
+                               uint32_t table_1_total,
+                               uint32_t table_2_total)
+{
+  
+  uint8_t k,cur_match,aligner,ref_byte_1,ref_byte_2,seq_byte,flag=0;
+  uint32_t i,hash_value,start_ref_index, end_ref_index, ref_index;
+  
+  char *cur_refs;
+   
+  char cur_seq[25]; 
+ 
+  result_GPU[(65536*kernel)+blockIdx.x].count = 0;
+  result_GPU[(65536*kernel)+blockIdx.x].position = 0; 
+ 
+
+   /*Copy read sequence from global memory to internal registers*/
+   for(i=0;i<25;i++)
+   cur_seq[i]= read_seq_GPU[(65536*kernel+blockIdx.x)*32 + i];
+ 
+   /*If it is the last index of table 1, we want to compare till end of table 2*/
+   if(table_1_end+1 == table_1_total/4)flag=1;
+  
+    /* Loop through the sequence array */
+
+    hash_value = 0;
+    for (k = 0; k < HASH_LENGTH; k++) {
+      cur_seq[k] = cur_seq[k] ;
+      hash_value |= (cur_seq[k]& 0x000000FF) << ((HASH_LENGTH-k-1)*8);
+    }
+    
+    /*Process only if the prefix exists for the block of table 2 present in this machine*/
+    if(hash_value>=table_1_start && hash_value < table_1_end+flag)
+    {
+  
+   /*Indices of the possible entries in table 2 that correspond to the 3 byte prefix*/
+    start_ref_index = GPU_table_1_base[hash_value];
+    
+    if(flag==1){
+      end_ref_index = table_2_total/4;
+      }else{   
+      end_ref_index = GPU_table_1_base[hash_value+1];
+     }
+   
+     for (i = start_ref_index; i < end_ref_index; i++) {
+               
+         ref_index = GPU_table_2_base[i-start_table_2];
+         
+         /*Check if the base pair position lies at byte boundary */
+         aligner = (ref_index%4)*2;
+         cur_refs = ref_genome_GPU + ref_index/4;;
+ 
+      cur_match = 1;
+      for (k = HASH_LENGTH; k < 25; k++) {
+	
+        seq_byte = cur_seq[k];
+        ref_byte_1 = cur_refs[k];
+        ref_byte_2 = cur_refs[k+1];
+        ref_byte_1 = ref_byte_1 >> aligner;
+        ref_byte_1 = ref_byte_1 & (0xFF >> aligner);
+        ref_byte_1 = ref_byte_1 | ((ref_byte_2 & (0xFF >> (8-aligner))) << 8-aligner); 
+	
+        if (seq_byte != ref_byte_1) {
+	  cur_match = 0;
+	  break;
+	}
+      }
+
+      
+      if (cur_match == 1) {
+	result_GPU[65536*kernel+blockIdx.x].count++;
+	result_GPU[65536*kernel+blockIdx.x].position = ref_index;
+      }
+
+    }
+  }
+
+}
+
+/* Attempt to match an array of two-bit sequences (*sequences)
+ * against a reference sequence (*reference_base).
+ *
+ * Fill in the *matches array with the results.
+ *
+ * This allocates a buffer large enough to hold a single sequence
+ * and shifts a portion of the reference sequence through it, based on 
+ * the starting indexes pointed to by hash_table1.  
+ * At each point, this buffer is compared to each of the given sequences.
+ */
+void match(struct match *matches,    /* Output array, one per sequence */
+	   uint32_t *table1_base,        /* Beginning of hash_table1 */
+	   off_t table1_total,       /* Number of bytes in hash_table1 */
+	   uint32_t *table2_base,        /* Beginning of hash_table2 */
+	   off_t table2_total,       /* Number of bytes in hash_table2 */
+	   char *reference_base,   /* Beginning of reference sequence */
+	   off_t reference_total,    /* Number of bytes in the reference */
+	   char *sequences,          /* Beginning of sequences */
+	   int32_t start_sequence,   /* Index of first sequence in array */
+	   int32_t sequence_length,  /* Base pairs per sequence */
+	   int32_t end_sequence,     /* One more than index of last sequence */
+           uint8_t machine )     
+{
+  
+  uint8_t i,no_of_kernels=0;
+  uint32_t  temp=0,start_ref_index=0, end_ref_index,last_kernel=0,start_table_1=0;
+  
+  uint32_t *GPU_table_1_base,*GPU_table_2_base,*table_2_start;;
+
+  char *ref_genome_GPU;
+  char *read_seq_GPU;
+  struct match *result_GPU;
+  char *read_sequence;
+
+  dim3 dimBlock(NUM_THREADS,1,1);
+  dim3 dimGrid(NUM_BLOCKS,1,1);
+
+  ticks time1,time2,time3;
+  double elapsed;
+
+  /* Bytes per sequence, padded to be a multiple of SEQUENCE_ALIGN */
+     int sequence_bytes = ((sequence_length + SEQUENCE_ALIGN * 4 - 1) & 
+                          ~(SEQUENCE_ALIGN*4 - 1)) >> 2;
+        
+     read_sequence = sequences + sequence_bytes*start_sequence;
+    
+     /*Start index of table 1 depends on the machine(1-23) executing the code*/
+     switch(machine)
+     {
+       case 1  : start_table_1 = 0;
+                 break;
+       case 2  : start_table_1 = 324703;
+                 break;
+       case 3  : start_table_1 = 915552;
+                 break;
+       case 4  : start_table_1 = 1499762;
+                 break;
+       case 5  : start_table_1 = 2138400;
+                 break;
+       case 6  : start_table_1 = 2985073;
+                 break;
+       case 7  : start_table_1 = 3652892;
+                 break;
+       case 8  : start_table_1 = 4358573;
+                 break;
+       case 9  : start_table_1 = 5311958;
+                 break;
+       case 10 : start_table_1 = 6225932;
+                 break;
+       case 11 : start_table_1 = 7269752;
+                 break;
+       case 12 : start_table_1 = 8126309;
+                 break;
+       case 13 : start_table_1 = 8701463;
+                 break;
+       case 14 : start_table_1 = 9393143;
+                 break;
+       case 15 : start_table_1 = 11240046;
+                 break;
+       case 16 : start_table_1 = 11862667;
+                 break;
+       case 17 : start_table_1 = 12525596;
+                 break;
+       case 18 : start_table_1 = 13032273;
+                 break;
+       case 19 : start_table_1 = 13687336;
+                 break;
+       case 20 : start_table_1 = 14414758;
+                 break;
+       case 21 : start_table_1 = 15248491;
+                 break;
+       case 22 : start_table_1 = 15872775;
+                 break;
+       case 23 : start_table_1 = 16503085;
+                 
+       }
+     
+     printf("Machine :%d\n ", machine);
+     
+     /*Calculate the start and end indices for this machine*/
+     start_ref_index= table1_base[start_table_1];
+     
+     /*Take in table 2 entries until size > 500 MB or end of table_1 is reached*/
+     temp = start_table_1;
+     while((table1_base[temp]-table1_base[start_table_1]<125000000) && temp!= table1_total/4)temp++;
+     
+     if(temp == table1_total/4){ 
+       end_ref_index=table2_total/4;
+       }else{
+       end_ref_index=table1_base[temp-1]; 
+      }                          
+     
+     table_2_start = table2_base + start_ref_index;
+     
+     /*Allocate space on GPU RAM for reference genome, results and hash_tables*/
+     cudaMalloc((void**) &ref_genome_GPU, reference_total);
+     cudaMalloc((void**) &result_GPU, (end_sequence-start_sequence)*sizeof(struct match));
+     cudaMalloc((void**) &GPU_table_1_base,table1_total);
+     cudaMalloc((void**) &GPU_table_2_base,4*(end_ref_index-start_ref_index) );
+ 
+     /*Copy data from Host to GPU RAM*/
+     cudaMemcpy(ref_genome_GPU,reference_base,reference_total,cudaMemcpyHostToDevice);
+     cudaMemcpy(GPU_table_1_base,table1_base,table1_total,cudaMemcpyHostToDevice); 
+     cudaMemcpy(GPU_table_2_base,table_2_start,4*(end_ref_index-start_ref_index),cudaMemcpyHostToDevice);   
+     
+     /*Start clock*/
+    time1=getticks();
+    
+     /*Allocate space for read sequences and copy them into the GPU RAM*/
+     cudaMalloc((void**) &read_seq_GPU, (end_sequence-start_sequence)*sequence_bytes);
+     cudaMemcpy(read_seq_GPU,read_sequence,(end_sequence-start_sequence)*sequence_bytes,cudaMemcpyHostToDevice);
+ 
+    if(end_sequence-start_sequence > 65535){
+     
+     no_of_kernels = (end_sequence-start_sequence)/65536;	     
+     last_kernel   = (end_sequence-start_sequence)%65536;	 
+ 
+     for(i=0;i<no_of_kernels;i++){
+   
+    /*Kernel Call*/
+    matchKernel<<<dimGrid,dimBlock>>>
+                                     (ref_genome_GPU,read_seq_GPU,result_GPU,GPU_table_1_base,GPU_table_2_base,
+                                      start_table_1,temp-1,i,start_ref_index,table1_total,table2_total);
+ 
+     /*Copy the results back to Host. This blocking call also makes sure that all thread writing to the result array have finished*/
+    cudaMemcpy(matches,result_GPU,sizeof(struct match)*(end_sequence-start_sequence),cudaMemcpyDeviceToHost);
+    
+    }
+
+    /*Process the remaining [(Total read sequences)%65536] read sequences */
+    matchKernel2<<<last_kernel,1>>> 
+                                   (ref_genome_GPU,read_seq_GPU,result_GPU,GPU_table_1_base,GPU_table_2_base,
+                                    start_table_1,temp-1,no_of_kernels,start_ref_index,table1_total,table2_total);
+    
+    cudaMemcpy(matches,result_GPU,sizeof(struct match)*(end_sequence-start_sequence),cudaMemcpyDeviceToHost);
+    
+    }
+    else{
+      
+      /*If total reads < 65536, we do not need multiple kernels*/
+      matchKernel2<<<(end_sequence-start_sequence),1>>> 
+                                               (ref_genome_GPU,read_seq_GPU,result_GPU,GPU_table_1_base,GPU_table_2_base,
+                                               start_table_1,temp-1,0,start_ref_index,table1_total,table2_total);
+    
+     /*Copy the results back to Host. This blocking call also makes sure that all thread writing to the result array have finished*/
+     
+       cudaMemcpy(matches,result_GPU,sizeof(struct match)*(end_sequence-start_sequence),cudaMemcpyDeviceToHost);
+      
+    }
+    
+    
+    time2 = getticks();
+    
+  for (temp = start_sequence ; temp != end_sequence ; ++temp) {
+    printf("%9d: ", temp);
+    if (matches[temp - start_sequence].count) {
+      printf("%9ld", matches[temp - start_sequence].position);
+      if (matches[temp-start_sequence].count > 1)
+	printf(" + %d others", matches[temp-start_sequence].count - 1);
+      printf("\n");
+    } else
+      printf("-\n");
+  }
+   
+     time3 = getticks();
+    
+     printf("Clock tick value at start: %ld\n",time1);
+     printf("Clock tick value at end of computation: %ld\n",time2);
+     printf("Clock tick value at end of print: %ld\n",time3);
+     
+     elapsed = (double)(time2 - time1) / TICKS_PER_SEC;
+     printf("Time taken for computation: %f seconds \n",elapsed);
+     
+     elapsed = (double)(time3 - time2) / TICKS_PER_SEC;
+     printf("Time taken for printing: %f seconds \n",elapsed);
+     
+     elapsed = (double)(time3 - time1) / TICKS_PER_SEC;
+     printf("Total time: %f seconds \n",elapsed);
+     
+
+      cudaFree(ref_genome_GPU);
+      cudaFree(read_seq_GPU);
+      cudaFree(result_GPU);
+      cudaFree(GPU_table_1_base);
+      cudaFree(GPU_table_2_base);
+
+     
+}
+
+/*
+ * Process command-line arguments, map reference and sequence data into
+ * memory, call match(), and print the results
+ */
+
+int main(int argc, const char *argv[]) {
+  const char *reference_filename, *sequence_filename,*machine_p;
+  int32_t reference_fd = -1, sequence_fd = -1;
+  int32_t table1_fd = -1, table2_fd = -1;
+
+  int sequence_length, sequence_bytes, start_sequence = -1, end_sequence = -1,num_sequences, i;
+  off_t reference_total, sequence_total, sequence_window_offset;
+  off_t table1_total, table2_total;
+  size_t sequence_window_length;
+
+  long page_size;
+
+  void *reference_base, *sequence_base, *sequences;
+  void *table1_base, *table2_base;
+
+  struct stat file_status;
+
+  struct match *matches;
+  uint8_t machine;
+  char machine_s[2];
+
+  
+
+
+
+  page_size = sysconf(_SC_PAGE_SIZE); /* needed for mmap */
+
+  if (argc < 5) goto usage;
+
+  reference_filename = argv[1];
+  sequence_filename = argv[2];
+
+  sequence_length = atoi(argv[3]);
+  
+  machine_p = argv[4];
+  strcpy(machine_s,machine_p+7);
+  machine = atoi(machine_s);
+  
+  if (machine <= 0 || machine > 23) {
+    fprintf(stderr,
+       "Error: Machine number must be an integer between 1 and 23\n");
+    goto usage;
+  }
+  
+  /* Pad the sequences out to a multiple of SEQUENCE_ALIGN bytes */
+  sequence_bytes = ((sequence_length + SEQUENCE_ALIGN * 4 - 1) & 
+		    ~(SEQUENCE_ALIGN * 4 - 1)) >> 2;
+
+  if (sequence_length <= 0) {
+    fprintf(stderr,
+       "Error: given sequence length must be an integer greater than zero\n");
+    goto usage;
+  }
+
+  if ((reference_fd = open(reference_filename, O_RDONLY)) < 0) {
+    fprintf(stderr, "Error opening reference file \"%s\": ",
+	    reference_filename);
+    perror((const char *) 0);
+    goto usage;
+  }
+
+  if (fstat(reference_fd, &file_status)) {
+    fprintf(stderr, "Error checking reference file \"%s\": ",
+	    reference_filename);
+    perror((const char *) 0);
+    goto usage;
+  }
+
+  reference_total = file_status.st_size;
+
+  if (reference_total < sequence_bytes) {
+    fprintf(stderr, "Error: reference file is shorter than the given sequence length (%d)\n", sequence_length);
+    goto usage;
+  }
+
+  if ((sequence_fd = open(sequence_filename, O_RDONLY)) < 0) {
+    fprintf(stderr, "Error opening sequence file \"%s\": ", sequence_filename);
+    perror((const char *) 0);
+    goto usage;
+  }
+
+  if (fstat(sequence_fd, &file_status)) {
+    fprintf(stderr, "Error checking sequence file \"%s\": ", 
+	    sequence_filename);
+    perror((const char *) 0);
+    goto usage;
+  }
+
+  sequence_total = file_status.st_size;
+  if (sequence_total < sequence_bytes) {
+    fprintf(stderr, "Sequence file is too small\n");
+    goto usage;
+  }
+
+  if (sequence_total % sequence_bytes != 0)
+    fprintf(stderr, "Warning: sequence file may be truncated\n");
+
+  num_sequences = sequence_total / sequence_bytes;
+
+  if (argc > 5) start_sequence = atoi(argv[5]);
+  if (start_sequence < 0) start_sequence = 0;
+  if (start_sequence >= num_sequences) {
+    fprintf(stderr, "Error: initial sequence number must be less than %d\n",
+	    num_sequences);
+    goto usage;
+  }
+
+  if (argc > 6) end_sequence = atoi(argv[6]);
+  else end_sequence = num_sequences;
+  if (end_sequence < start_sequence || end_sequence > num_sequences) {
+    fprintf(stderr, "Error: End sequence number must be between %d and %d\n",
+	    start_sequence, num_sequences);
+    goto closeexit;
+  }
+
+
+  /* Open the hash table files */
+  if ((table1_fd = open("hash_table1.bin", O_RDONLY)) < 0) {
+    fprintf(stderr, "Error opening hash_table1.bin file");
+    perror((const char *) 0);
+    goto usage;
+  }
+
+  if (fstat(table1_fd, &file_status)) {
+    fprintf(stderr, "Error checking hash_table1.bin file");
+    perror((const char *) 0);
+    goto usage;
+  }
+  table1_total = file_status.st_size;
+ 
+  /* Open the hash table files */
+  if ((table2_fd = open("hash_table2.bin", O_RDONLY)) < 0) {
+    fprintf(stderr, "Error opening hash_table2.bin file");
+    perror((const char *) 0);
+    goto usage;
+  }
+
+  if (fstat(table2_fd, &file_status)) {
+    fprintf(stderr, "Error checking hash_table2.bin file");
+    perror((const char *) 0);
+    goto usage;
+  }
+  table2_total = file_status.st_size;
+  
+
+  /* mmap the reference data */
+  reference_base = mmap( (void *) 0, reference_total, PROT_READ, MAP_SHARED,
+			 reference_fd, 0);
+
+  if (reference_base == MAP_FAILED) {
+    perror("Error when attempting to map the reference file");
+    goto unmap_references;
+  }
+
+
+  /* mmap the hash_table data */
+  table1_base = mmap( (void *) 0, table1_total, PROT_READ, MAP_SHARED,
+			 table1_fd, 0);
+
+  if (table1_base == MAP_FAILED) {
+    perror("Error when attempting to map the hash_table1 file");
+    goto unmap_table1;
+  }
+
+  /* mmap the hash_table data */
+  table2_base = mmap( (void *) 0, table2_total, PROT_READ, MAP_SHARED,
+			 table2_fd, 0);
+
+  if (table2_base == MAP_FAILED) {
+    perror("Error when attempting to map the hash_table1 file");
+    goto unmap_table2;
+  }
+
+
+  /* mmap the sequence data */
+  /* compute the starting location by rounding down to the nearest
+     page boundary; window length is the difference between this and the last
+     page on which the sequences fall */
+  sequence_window_offset = (start_sequence * sequence_bytes) & ~(page_size - 1);
+  sequence_window_length = (((end_sequence * sequence_bytes) + (page_size - 1))
+			    & ~(page_size - 1)) - sequence_window_offset;
+
+  sequence_base = mmap( (void *) 0, sequence_window_length, PROT_READ,
+			MAP_SHARED, sequence_fd, sequence_window_offset);
+
+  if (sequence_base == MAP_FAILED) {
+    perror("Error when attempting to map the sequence file");
+    goto closeexit;
+  }
+
+  sequences = (char *)sequence_base +
+    ((start_sequence * sequence_bytes) - sequence_window_offset);
+
+
+  /* Allocate space to hold the results of matching */
+  matches = (struct match *)malloc(sizeof(struct match)*(end_sequence-start_sequence));
+  if (matches == NULL) {
+    fprintf(stderr, "Failed to allocate memory for match information\n");
+    goto unmap_sequences;
+  }
+
+  /*Initialize the output array to a random value to understand if the kernel crashed*/
+  for ( i = 0 ; i < end_sequence - start_sequence ; i++ )
+    matches[i].count = 13;
+  
+  /* Call the sequence matcher with the starting address of the reference,
+     starting address of the sequences, the ending address, the number
+     of pairs in the sequence, and the length of the reference */
+    match(matches, 
+	(uint32_t *)table1_base, table1_total,
+	(uint32_t *)table2_base, table2_total,
+	(char*)reference_base, reference_total,
+	(char*)sequences, start_sequence, sequence_length, end_sequence,machine);
+  
+  /* Report all matches */
+  
+
+ 
+
+  free(matches);
+
+ unmap_sequences:
+  if (munmap(sequence_base, sequence_window_length)) {
+    perror("Error when unmapping the sequence file");
+    goto closeexit;
+  }
+
+ unmap_references:
+  if (munmap(reference_base, reference_total)) {
+    perror("Error when unmapping the reference file");
+    goto closeexit;
+  }
+
+ unmap_table1:
+  if (munmap(table1_base, table1_total)) {
+    perror("Error when unmapping the hash_table1 file");
+    goto closeexit;
+  }  
+
+ unmap_table2:
+  if (munmap(table2_base, table2_total)) {
+    perror("Error when unmapping the hash_table2 file");
+    goto closeexit;
+  }  
+
+
+  close(sequence_fd);
+  close(reference_fd);
+  close(table1_fd);
+  close(table2_fd);
+  
+
+ 
+  
+  return 0;
+
+ usage:
+  fprintf(stderr,
+	  "usage: align <reference-genome> <sequence-file> <sequence-length> <machine-number> <start> <end>\n"
+	  "<reference-genome> is the name of a packed binary reference sequence.\n"
+	  "<sequence-file> is the name of a packed binary sequence file.\n"
+	  "<sequence-length> is an integer indicating the length, in base pairs, of each sequence.\n"
+          "<machine-number> is an integer specifying the machine. Value should be between 1 and 23"
+	  "<start> is the optional starting sequence number.  If omitted, it defaults to the start of the sequence file.\n"
+	  "<end> is the optional ending sequence number.  If omitted, it defaults to the end of the sequence file.\n");
+ closeexit:
+  if (reference_fd >= 0) close(reference_fd);
+  if (sequence_fd >= 0) close(sequence_fd);
+  return 1;
+}

@@ -1,0 +1,43 @@
+# Folder Contents
+
+1. gen-hash.c - C file to generate the Hash Tables - hash_table1.bin and hash_table2.bin
+Usage: 
+$ cc -O3 -o gen-hash gen-hash.c
+$ ./gen-hash <reference_genome_file>
+
+
+
+2. hash-align.cu - CUDA file that matches read sequences of length 100 base pairs to the reference genome.
+Usage:
+$ nvcc -O3 -o hash-align hash-align.cu
+$ ./hash-align <reference_genome_file> <read_sequence_file> 100 <machine_number> <start_sequence> <end_sequence>
+
+Usage NOTES:
+a. Name of the reference_genome_file : human_g1k_v37.bin
+b. Name of the read_sequence_file : ERR050082.filt.bin
+c. Start sequence should be a number between 0 and 283172 for the given read_sequence_file. Default value is 0.
+d. End sequence should be a number between start sequence and 283173 for the given read_sequence_file. Default value is last index in the read sequence file.
+e. The files hash_table1.bin and hash_table2.bin are already provided in the folder.
+f. Machine number is a one of the strings provided in co2050.lst. The application needs to be executed for all the strings provided in the co2050.lst file. The multi-align.sh script does this.
+
+3. setup.sh - Bash script file to copy the files in the machines specified in co2050.lst .
+Usage:
+$ bash setup.sh co2050.lst hash-align.cu <reference_genome_file> <read_sequence_file> hash_table1.bin hash_table2.bin
+
+Usage Notes:
+a. When the COMPILE_ONLY flag is 0 all the reference_genome_file, read_sequence_file,hash_tables and hash-align.cu are copied.
+When COMPILE_ONLY flag is set to 1, only the hash-align.cu file is copied.
+b.The CUDA source code is compiled for each run of the script. 
+
+4. multi-align.sh - Bash script file to execute the binary on all the machines specified in co2050.lst 
+Usage:
+$ bash multi-align.sh co2050.lst hash-align.cu <reference_genome_file> <read_sequence_file> <start_sequence> <end_sequence>
+
+Usage Notes:
+a. co2050.lst has 23 machine ids specified in it. All the machines are required to perform matching for all the reads in the read sequence file. 
+b. Start sequence should be a number between 0 and 283172 for the given read_sequence_file. Default value is 0.
+c. End sequence should be a number between start sequence and 283173 for the given read_sequence_file. Default value is last index in the read sequence file.
+
+
+
+ 
